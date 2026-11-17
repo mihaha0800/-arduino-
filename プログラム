@@ -1,0 +1,169 @@
+#include <Arduino_LED_Matrix.h>
+#include <WiFiS3.h>
+#include <misakiUTF16.h> // インストールしたみさきフォントライブラリ
+
+const char ssid[] = "Arduino_R4_Direct"; 
+const char pass[] = "12345678";         
+
+WiFiServer server(80);
+ArduinoLEDMatrix matrix;
+
+// 初期表示メッセージ（日本語OK）
+String currentMessage = "こんにちは！"; 
+
+// 1文字分のフォントデータ（8x8ドット）を格納するバッファ
+byte fontData[8];
+
+// UTF-8文字列をみさきフォントでドット展開してスクロール表示する関数
+void scrollJapaneseText(String text) {
+  const char* p = text.c_str();
+  int len = text.length();
+  
+  // 文字列全体の横幅ピクセル数を計算（最大50文字程度を想定）
+  int maxCols = len * 8 + 24;
+  uint8_t* canvas = (uint8_t*)calloc(maxCols, sizeof(uint8_t));
+  if (!canvas) return;
+
+  int col = 12; // 左側の余白（画面外から入ってくるように12ドット空ける）
+
+  while (*p != '\0') {
+    // 1文字分のUTF-8データをみさきフォントの8x8ドットに変換
+    p = getFontData(fontData, p);
+    
+    // 半角文字か全角文字かで幅を判定（半角は4ドット、全角は8ドット）
+    // ※みさきフォントは左詰めでデータが入るため、右側の空き列を確認
+    int charWidth = 8;
+    bool isHalf = true;
+    for (int r = 0; r < 8; r++) {
+      if (fontData[r] & 0x0F) { // 下位4ビットにドットがあれば全角
+        isHalf = false;
+        break;
+      }
+    }
+    if (isHalf) charWidth = 4;
+
+    // 縦8ドット×横charWidthドットのデータをキャンバスに書き込み
+    for (int c = 0; c < charWidth; c++) {
+      if (col >= maxCols - 12) break;
+      uint8_t colBits = 0;
+      for (int r = 0; r < 8; r++) {
+        if (fontData[r] & (0x80 >> c)) {
+          colBits |= (1 << r);
+        }
+      }
+      canvas[col++] = colBits;
+    }
+  }
+  col += 12; // 右側の余白
+
+  // キャンバスを1ドットずつ左にずらしながらLEDマトリクスに転送
+  for (int shift = 0; shift < col - 12; shift++) {
+    // スクロール中にスマホから新しい通信が来たら即座に中断して反応を良くする
+    if (server.available()) {
+      break;
+    }
+
+    uint32_t frame[3] = {0, 0, 0};
+    for (int r = 0; r < 8; r++) {
+      for (int c = 0; c < 12; c++) {
+        if (canvas[shift + c] & (1 << r)) {
+          int bitIndex = r * 12 + c;
+          int arrayIdx = bitIndex / 32;
+          int bitPos = 31 - (bitIndex % 32);
+          frame[arrayIdx] |= (1UL << bitPos);
+        }
+      }
+    }
+    matrix.loadFrame(frame);
+    delay(75); // スクロール速度（数値を小さくすると速くなります）
+  }
+
+  free(canvas);
+}
+
+void setup() {
+  matrix.begin();
+  WiFi.beginAP(ssid, pass);
+  server.begin();
+}
+
+void loop() {
+  // 1. スマホからの新しい接続をチェック
+  WiFiClient client = server.available();
+  
+  if (client) {
+    String currentLine = "";
+    boolean isPost = false;
+    int contentLength = 0;
+    
+    while (client.connected()) {
+      if (client.available()) {
+        char c = client.read();
+        
+        if (currentLine.startsWith("POST ")) isPost = true;
+        if (currentLine.startsWith("Content-Length: ")) {
+          contentLength = currentLine.substring(16).toInt();
+        }
+        
+        if (c == '\n') {
+          if (currentLine.length() == 0) {
+            if (isPost && contentLength > 0) {
+              String bodyData = "";
+              for (int i = 0; i < contentLength; i++) {
+                while(!client.available()); 
+                bodyData += (char)client.read();
+              }
+              if (bodyData.startsWith("text=")) {
+                String newText = urlDecodeUTF8(bodyData.substring(5));
+                if (newText.length() > 0) {
+                  currentMessage = newText; 
+                }
+              }
+            }
+
+            // スマホに操作画面（HTML）を返す
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html; charset=utf-8");
+            client.println("Connection: close\n");
+            client.println("<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta charset=\"utf-8\"><style>body{text-align:center; font-family:sans-serif; padding-top:40px; background-color:#f4f4f9;} input[type=text]{font-size:24px; padding:12px; width:85%; max-width:400px; margin-bottom:20px; border:2px solid #ccc; border-radius:6px;} button{font-size:24px; padding:12px 40px; background-color:#28a745; color:white; border:none; border-radius:6px; font-weight:bold;}</style></head><body>");
+            client.println("<h1>Arduino R4 日本語掲示板</h1>");
+            client.print("<p style='color:#555;'>現在の表示: <b>" + currentMessage + "</b></p>");
+            client.println("<input type=\"text\" id=\"msg\" placeholder=\"漢字・ひらがな・カタカナ・英数字\"><br>");
+            client.println("<button onclick=\"send()\">LEDに送信</button>");
+            client.println("<script>function send(){var txt=document.getElementById('msg').value; if(!txt)return; fetch('/',{method:'POST',body:'text='+encodeURIComponent(txt)}).then(()=>{alert('送信しました！'); location.reload();});}</script></body></html>");
+            break;
+          } else {
+            currentLine = "";
+          }
+        } else if (c != '\r') {
+          currentLine += c;
+        }
+      }
+    }
+    client.stop();
+  }
+
+  // 2. 記憶している日本語メッセージを永遠に繰り返しスクロール表示
+  if (currentMessage.length() > 0) {
+    scrollJapaneseText(currentMessage);
+  }
+}
+
+// UTF-8の日本語・記号・スペースを正しく復元するデコード関数
+String urlDecodeUTF8(String str) {
+  String decoded = "";
+  int len = str.length();
+  for (int i = 0; i < len; i++) {
+    if (str[i] == '+') {
+      decoded += ' ';
+    } else if (str[i] == '%' && i + 2 < len) {
+      String hex = str.substring(i + 1, i + 3);
+      char ch = (char) strtol(hex.c_str(), NULL, 16);
+      decoded += ch;
+      i += 2;
+    } else {
+      decoded += str[i];
+    }
+  }
+  return decoded;
+}
